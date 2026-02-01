@@ -198,10 +198,8 @@ impl ClientPool {
                 // These client IDs are temporarily stored as a vec structure.
                 let mut to_remove = Vec::new();
                 for (id, h) in clients.iter() {
-                    if !h.used_flag && h.idle_tick + idle_timeout < now {
-                        if pool_len - to_remove.len() > CLIENT_POOL_DEFAULT_SIZE {
+                    if !h.used_flag && h.idle_tick + idle_timeout < now && pool_len - to_remove.len() > CLIENT_POOL_DEFAULT_SIZE{
                             to_remove.push(*id);
-                        }
                     }
                 }
 
@@ -244,8 +242,7 @@ impl ClientPool {
 
                 // Acquire a write lock to modify the state
                 let mut pool_write = self.inner.write().await;
-                if let Some(client_inner) = pool_write.get_mut(&id) {
-                    if !client_inner.used_flag {
+                if let Some(client_inner) = pool_write.get_mut(&id) && !client_inner.used_flag {
                         client_inner.used_flag = true;
                         client_inner.idle_tick = Instant::now();
                         let client = client_inner.client.clone();
@@ -255,7 +252,6 @@ impl ClientPool {
                             release_tx: self.release_tx.clone(),
                             id,
                         });
-                    }
                 }
                 // If another thread preempts it, continue the loop.
             } else {
