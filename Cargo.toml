@@ -1,0 +1,23 @@
+[package]
+name = "reqwest-management-pool"
+version = "0.1.0"
+edition = "2024"
+description = "advanced reqwest pool management to improve utilization per client."
+keywords = ["http", "request", "client"]
+readme = "README.md"
+license = "MIT"
+rust-version = "1.92.0"
+authors = ["zilboe <zilboe1106@gmail.com>"]
+[lib]
+name = "reqwest_management_pool"
+path = "src/lib.rs"
+
+
+[dependencies]
+tokio = { version = "1.49.0", features = ["full"] }
+reqwest = { version = "0.13.1" }
+rand = "0.9.2"
+
+[dev-dependencies]
+serde = "1.0.228"
+serde_json = "1.0.149"
