@@ -7,10 +7,10 @@ keywords = ["pool", http", "request", "client"]
 readme = "README.md"
 license = "MIT"
 rust-version = "1.92.0"
-authors = ["zilboe <zilboe1106@gmail.com>"]
 homepage = "https://crates.io/users/zilboe"
 repository = "https://github.com/zilboe/reqwest-management-pool"
-
+documentation = "https://docs.rs/reqwest-management-pool"
+authors = ["zilboe <zilboe1106@gmail.com>"]
 [lib]
 name = "reqwest_management_pool"
 path = "src/lib.rs"
