@@ -25,7 +25,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-reqwest-management-pool = "0.1.0"
+reqwest-management-pool = "0.1.1"
 tokio = { version = "1.49.0", features = ["full"] }
 reqwest = "0.13.1"
 ```
@@ -242,7 +242,7 @@ This project is licensed under the MIT License.
 
 ```toml
 [dependencies]
-reqwest-management-pool = "0.1.0"
+reqwest-management-pool = "0.1.1"
 tokio = { version = "1.49.0", features = ["full"] }
 reqwest = "0.13.1"
 ```
@@ -443,4 +443,3 @@ async fn main() {
 Contributions are welcome! Please feel free to submit a Pull Request.
 
 欢迎贡献！请随时提交 Pull Request。
-
