@@ -1,6 +1,6 @@
 //! # ReqwestManagementPool
 //!
-//! A client management pool based on ReqWest and Tokio ensures
+//! A client management pool based on Reqwest and Tokio ensures
 //! that clients with different configurations can be reused,
 //! reducing memory consumption.
 //!
@@ -21,7 +21,7 @@
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Create and initialize the connection pool
 //!     let pool = ClientPool::new();
-//!     
+//!
 //!     // Get clients from the pool
 //!     if let Some(client) = pool.malloc().await {
 //!         // Send a request using the client.
@@ -29,17 +29,17 @@
 //!             .get("https://example.com")
 //!             .send()
 //!             .await?;
-//!         
+//!
 //!         // The client will automatically release it back into the pool when the scope ends.
 //!     }
-//!     
+//!
 //!     Ok(())
 //! }
 //! ```
 // Default client pool size
 const CLIENT_POOL_DEFAULT_SIZE: usize = 8;
 // Scheduled task processing by the idle client(sec)
-const CLIENT_POOL_IDLE_TASK_TIMEOUT: u64 = 120; 
+const CLIENT_POOL_IDLE_TASK_TIMEOUT: u64 = 120;
 // Idle client timeout value(sec)
 const CLIENT_POOL_IDLE_CLEANUP_TIMEOUT: u64 = 180;
 
@@ -56,7 +56,6 @@ use tokio::{
     sync::{RwLock, mpsc},
     time::{self, Instant},
 };
-
 
 #[derive(Clone)]
 struct ClientInner {
@@ -117,9 +116,10 @@ impl Drop for PooledClientInner {
     /// When dropping, send an ID notification.
     fn drop(&mut self) {
         if let Err(e) = self.release_tx.send(self.id) {
-            eprintln!(
+            tracing::error!(
                 "Failed to send release request for client {}: {:?}",
-                self.id, e
+                self.id,
+                e
             );
         }
     }
@@ -165,7 +165,7 @@ impl ClientPool {
                     inner.used_flag = false;
                     inner.idle_tick = Instant::now();
                 } else {
-                    eprintln!("Warning: tried to release non-existent client {}", id);
+                    tracing::warn!("Warning: tried to release non-existent client {}", id);
                 }
             }
         });
@@ -372,7 +372,10 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(sleep_time)).await;
 
                     match simulate_http_request(&client).await {
-                        Ok(_) => println!("  Request {}: ✓ Successful (Time taken {}ms)", i, sleep_time),
+                        Ok(_) => println!(
+                            "  Request {}: ✓ Successful (Time taken {}ms)",
+                            i, sleep_time
+                        ),
                         Err(e) => println!("  Request {}: ✗ Failed: {}", i, e),
                     }
 
@@ -391,7 +394,10 @@ mod tests {
         }
 
         let total_time = start_time.elapsed().as_secs_f32();
-        println!("Concurrent request test complete, total time: {:.2} seconds", total_time);
+        println!(
+            "Concurrent request test complete, total time: {:.2} seconds",
+            total_time
+        );
     }
 
     /// Test sudden surge in requests
@@ -490,11 +496,17 @@ mod tests {
             // The status is printed once every 100 requests.
             if request_count % 100 == 0 {
                 let elapsed = start_time.elapsed().as_secs();
-                println!("  [T+{}s] {} requests have been processed.", elapsed, request_count);
+                println!(
+                    "  [T+{}s] {} requests have been processed.",
+                    elapsed, request_count
+                );
             }
         }
 
-        println!("The long-running test has completed, processing a total of {} requests.", request_count);
+        println!(
+            "The long-running test has completed, processing a total of {} requests.",
+            request_count
+        );
     }
 
     /// Simulate HTTP requests
@@ -521,7 +533,10 @@ mod tests {
         // Create a connection pool
         let pool = ClientPool::new();
 
-        println!("✓ Connection pool created successfully, default size: {}", CLIENT_POOL_DEFAULT_SIZE);
+        println!(
+            "✓ Connection pool created successfully, default size: {}",
+            CLIENT_POOL_DEFAULT_SIZE
+        );
 
         // Monitoring task - Print pool status once per second
         let pool_monitor = pool.clone();
