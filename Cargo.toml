@@ -1,9 +1,9 @@
 [package]
 name = "reqwest-management-pool"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "advanced reqwest pool management to improve utilization per client."
-keywords = ["pool", http", "request", "client"]
+keywords = ["pool", "http", "request", "client"]
 readme = "README.md"
 license = "MIT"
 rust-version = "1.92.0"
