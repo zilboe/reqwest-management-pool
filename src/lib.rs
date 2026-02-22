@@ -36,660 +36,254 @@
 //!     Ok(())
 //! }
 //! ```
-// Default client pool size
-const CLIENT_POOL_DEFAULT_SIZE: usize = 8;
-// Scheduled task processing by the idle client(sec)
-const CLIENT_POOL_IDLE_TASK_TIMEOUT: u64 = 120;
-// Idle client timeout value(sec)
-const CLIENT_POOL_IDLE_CLEANUP_TIMEOUT: u64 = 180;
-
+//!
+//! ## Configuration
 use reqwest::Client;
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
-use tokio::{
-    sync::{
-        RwLock,
-        mpsc::{self},
-    },
-    time::{self, Instant},
-};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::time::{self, Duration, Instant};
 
-#[derive(Clone)]
-struct ClientInner {
-    // client obtained from the reqwest library.
+// Configuration constants
+const MIN_IDLE_SIZE: usize = 8; // Minimum number of clients to keep in the pool
+const MAX_POOL_SIZE: usize = 50; // Maximum total clients (active + idle)
+const IDLE_TIMEOUT: Duration = Duration::from_secs(120); // Time before an idle client is retired
+const MONITOR_INTERVAL: Duration = Duration::from_secs(180); // Time between pool metrics reports
+/// Internal wrapper for an idle client with a timestamp
+struct IdleClient {
     client: Client,
-    // flag that was requested to be used
-    used_flag: bool,
-    // tick used to record applications and releases
-    idle_tick: Instant,
-
-    is_leak: bool,
+    last_used: Instant,
 }
 
-impl ClientInner {
-    // `new` function creates and initializes an Inner.
-    fn new() -> Self {
-        ClientInner {
-            client: Client::new(),
-            used_flag: false,
-            idle_tick: Instant::now(),
-            is_leak: false,
-        }
-    }
-}
-
-impl Default for ClientInner {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Drop for ClientInner {
-    /// Clear the used flag and set the tick
-    fn drop(&mut self) {
-        self.used_flag = false;
-        self.idle_tick = Instant::now();
-    }
-}
-
-// Pooled clients
-pub struct PooledClientInner {
-    // Client for external use
-    client: Client,
-    // tx channel, used for dropping
-    release_tx: mpsc::UnboundedSender<usize>,
-    // ID used to notify drop
-    id: usize,
-    // Leakage Notice
-    leak_notice: mpsc::UnboundedSender<usize>,
-}
-
-impl PooledClientInner {
-    pub fn get(&self) -> &Client {
-        &self.client
-    }
-
-    pub fn id(&self) -> usize {
-        self.id
-    }
-}
-
-impl Drop for PooledClientInner {
-    /// When dropping, send an ID notification.
-    fn drop(&mut self) {
-        if let Err(e) = self.release_tx.send(self.id) {
-            tracing::warn!("Client drop, failed to send 'release' notification");
-            tracing::warn!("{e}");
-            if let Err(e) = self.leak_notice.send(self.id) {
-                tracing::error!("Failed to send leaked information, id:{}", self.id);
-                tracing::error!("{e}");
-            }
-        }
-    }
-}
-
-// Main structure of the client management pool
+/// The main structure for the HTTP client management pool
 #[derive(Clone)]
 pub struct ClientPool {
-    // Client-side architecture.
-    // Uses a HashMap for storage.
-    // Manages concurrency and multitasking using Arc and Rwlock.
-    inner: Arc<RwLock<HashMap<usize, ClientInner>>>,
-    // Used to update the ID of a position in the hashmap.
-    // Primarily for easier push functionality.
-    update_id: Arc<AtomicUsize>,
+    semaphore: Arc<Semaphore>,
+    idle_rx: Arc<Mutex<mpsc::Receiver<IdleClient>>>,
+    release_tx: mpsc::Sender<IdleClient>,
 
-    // This is the same as `release_tx` in the `PooledClient` structure.
-    release_tx: mpsc::UnboundedSender<usize>,
+    // Thread-safe counters for monitoring
+    idle_count: Arc<AtomicUsize>,  // Current clients sitting in the pool
+    total_count: Arc<AtomicUsize>, // Total clients managed (idle + working)
+}
 
-    // Leaking the channel through which the client sends notifications
-    handle_leak_channel: mpsc::UnboundedSender<usize>,
-    handle_leak_client: Arc<RwLock<Vec<usize>>>,
+/// A smart wrapper for a borrowed client. Returns to pool automatically on Drop.
+pub struct PooledClient {
+    client: Option<Client>,
+    _permit: OwnedSemaphorePermit, // Holds the slot in the semaphore
+    release_tx: mpsc::Sender<IdleClient>,
+    idle_count: Arc<AtomicUsize>,
+}
+
+impl PooledClient {
+    /// Get a reference to the inner reqwest Client
+    pub fn get(&self) -> &Client {
+        self.client.as_ref().expect("Client should be present")
+    }
+}
+
+impl Drop for PooledClient {
+    /// When the user is done with the client, send it back to the idle queue
+    fn drop(&mut self) {
+        if let Some(client) = self.client.take() {
+            let tx = self.release_tx.clone();
+            let count_ref = self.idle_count.clone();
+            let idle = IdleClient {
+                client,
+                last_used: Instant::now(),
+            };
+
+            tokio::spawn(async move {
+                if let Ok(_) = tx.send(idle).await {
+                    // Successfully returned to pool, increment idle count
+                    count_ref.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        }
+    }
 }
 
 impl ClientPool {
-    /// Create a new HTTP client pool
-    ///
-    /// The pool will pre-create `CLIENT_POOL_DEFAULT_SIZE` clients.
+    /// Create a new ClientPool and initialize core clients
     pub fn new() -> Self {
-        let mut map_client: HashMap<usize, ClientInner> = HashMap::new();
-        for i in 0..CLIENT_POOL_DEFAULT_SIZE {
-            let one_client = ClientInner::new();
-            map_client.insert(i, one_client);
+        let (tx, rx) = mpsc::channel(MAX_POOL_SIZE);
+        let idle_count = Arc::new(AtomicUsize::new(0));
+        let total_count = Arc::new(AtomicUsize::new(0));
+
+        // Pre-fill the pool with the minimum idle clients
+        for _ in 0..MIN_IDLE_SIZE {
+            let _ = tx.try_send(IdleClient {
+                client: Client::new(),
+                last_used: Instant::now(),
+            });
+            idle_count.fetch_add(1, Ordering::Relaxed);
+            total_count.fetch_add(1, Ordering::Relaxed);
         }
-        let lock = RwLock::new(map_client);
 
-        let arc = Arc::new(lock);
-        let (release_tx, release_rx) = mpsc::unbounded_channel();
-
-        // Create a list of leaked clients
-        let arc_leak_client: Arc<RwLock<Vec<usize>>> = Arc::new(RwLock::new(Vec::new()));
-
-        // Starting a background task is used to set the client to terminate after use.
-        let pool_inner = arc.clone();
-        tokio::spawn(async move {
-            let mut rx = release_rx;
-            while let Some(id) = rx.recv().await {
-                let mut pool = pool_inner.write().await;
-                if let Some(inner) = pool.get_mut(&id) {
-                    inner.used_flag = false;
-                    inner.idle_tick = Instant::now();
-                } else {
-                    tracing::warn!("Warning: tried to release non-existent client {}", id);
-                }
-            }
-        });
-
-        // Handling client leak
-        let pool_leak_handle = arc.clone();
-        let pool_leak_client_clone = arc_leak_client.clone();
-        // Create a send/receive channel to handle client leaks.
-        let (leak_channel_tx, leak_channel_rx) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            let mut handle_channel_rx = leak_channel_rx;
-            while let Some(id) = handle_channel_rx.recv().await {
-                // Acquire a write lock for handling client leaks.
-                let mut handle_leak_client = pool_leak_client_clone.write().await;
-                // The pool of main clients
-                let mut pool = pool_leak_handle.write().await;
-                if let Some(inner) = pool.get_mut(&id) {
-                    // This client has been flagged as leaked.
-                    inner.is_leak = true;
-                    // Add the client to the list
-                    handle_leak_client.push(id);
-                    // tracing::warn!(
-                    //     "Warning: client id {}, {}, tick:{:?}",
-                    //     leak_event.id,
-                    //     leak_event.error,
-                    //     leak_event.tick
-                    // );
-                } else {
-                    tracing::error!(
-                        "Error: Client id {id} leaked, list not found",
-                        // leak_event.id,
-                        // leak_event.tick
-                    );
-                }
-            }
-        });
-
-        let pool = ClientPool {
-            inner: arc,
-            update_id: Arc::new(AtomicUsize::new(CLIENT_POOL_DEFAULT_SIZE)),
-            release_tx,
-            handle_leak_channel: leak_channel_tx,
-            handle_leak_client: arc_leak_client,
+        let pool = Self {
+            semaphore: Arc::new(Semaphore::new(MAX_POOL_SIZE)),
+            idle_rx: Arc::new(Mutex::new(rx)),
+            release_tx: tx,
+            idle_count,
+            total_count,
         };
 
-        // Start a background task to periodically clean up timed-out and unused clients.
-        let pool_clone = pool.clone();
-
-        tokio::spawn(async move {
-            let pool_inner_cleanup = pool_clone.inner.clone();
-            let pool_inner_leak_cleanup = pool_clone.handle_leak_client.clone();
-            let mut interval = time::interval(Duration::from_secs(CLIENT_POOL_IDLE_TASK_TIMEOUT));
-            loop {
-                interval.tick().await;
-                let now = Instant::now();
-                let idle_timeout = Duration::from_secs(CLIENT_POOL_IDLE_CLEANUP_TIMEOUT);
-
-                let leaks_id: Vec<usize> = {
-                    let leaks_client = pool_inner_leak_cleanup.write().await;
-                    leaks_client.iter().copied().collect()
-                };
-
-                if !leaks_id.is_empty() {
-                    let mut clients = pool_inner_cleanup.write().await;
-                    for leak_id in &leaks_id {
-                        clients.remove(leak_id);
-                    }
-                    drop(clients);
-                    {
-                        let mut leaks_client = pool_inner_leak_cleanup.write().await;
-                        leaks_client.clear();
-                    }
-
-                    tracing::info!("Cleaned up {} leak client", leaks_id.len());
-                };
-
-                {
-                    let mut clients = pool_inner_cleanup.write().await;
-                    let pool_len = clients.len();
-
-                    // If the current quantity is too low, stop recycling.
-                    if pool_len <= CLIENT_POOL_DEFAULT_SIZE {
-                        continue;
-                    }
-
-                    // Delete expired and unused clients
-                    // These client IDs are temporarily stored as a vec structure.
-                    let mut to_remove = Vec::new();
-                    for (id, h) in clients.iter() {
-                        if !h.used_flag
-                            && h.idle_tick + idle_timeout < now
-                            && pool_len - to_remove.len() > CLIENT_POOL_DEFAULT_SIZE
-                        {
-                            to_remove.push(*id);
-                        }
-                    }
-
-                    // Find the minimum value in vec and update update_id
-                    // if let Some(min_id) = to_remove.iter().min() {
-                    //     pool_clone.update_id.store(*min_id, Ordering::Relaxed);
-                    // }
-
-                    for id in to_remove {
-                        clients.remove(&id);
-                    }
-                }
-            }
-        });
+        // Start background maintenance tasks
+        pool.start_cleanup_task();
+        pool.start_monitor_reporter(MONITOR_INTERVAL);
 
         pool
     }
 
-    pub async fn malloc(&self) -> Option<PooledClientInner> {
-        for _ in 0..3 {
-            // Acquire read lock
-            let pool = self.inner.read().await;
+    /// Background task to clean up expired idle clients (Scale Down)
+    fn start_cleanup_task(&self) {
+        let idle_rx = self.idle_rx.clone();
+        let release_tx = self.release_tx.clone();
+        let idle_count = self.idle_count.clone();
+        let total_count = self.total_count.clone();
 
-            // Find idle clients
-            let (id, used_flag) = {
-                let selected = pool
-                    .iter()
-                    .find(|(_, h)| !h.used_flag)
-                    .map(|(id, h)| (*id, h.used_flag));
+        tokio::spawn(async move {
+            let mut interval = time::interval(Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                let mut rx = idle_rx.lock().await;
+                let mut kept = Vec::new();
 
-                match selected {
-                    Some((id, false)) => (id, false),
-                    _ => (0, true), // No idle clients
+                // Drain the channel to inspect all idle clients
+                while let Ok(idle) = rx.try_recv() {
+                    idle_count.fetch_sub(1, Ordering::Relaxed);
+
+                    if idle.last_used.elapsed() < IDLE_TIMEOUT || kept.len() < MIN_IDLE_SIZE {
+                        kept.push(idle);
+                    } else {
+                        // Retired: Decrement the total count of clients in the system
+                        total_count.fetch_sub(1, Ordering::Relaxed);
+                    }
                 }
-            };
 
-            // If there are idle clients, try upgrading to a write lock to mark them for use.
-            if !used_flag {
-                // Release read lock
-                drop(pool);
-
-                // Acquire a write lock to modify the state
-                let mut pool_write = self.inner.write().await;
-                if let Some(client_inner) = pool_write.get_mut(&id)
-                    && !client_inner.used_flag
-                {
-                    client_inner.used_flag = true;
-                    client_inner.idle_tick = Instant::now();
-                    let client = client_inner.client.clone();
-
-                    return Some(PooledClientInner {
-                        client,
-                        release_tx: self.release_tx.clone(),
-                        id,
-                        leak_notice: self.handle_leak_channel.clone(),
-                    });
+                // Push kept clients back into the channel
+                for item in kept {
+                    let _ = release_tx.send(item).await;
+                    idle_count.fetch_add(1, Ordering::Relaxed);
                 }
-                // If another thread preempts it, continue the loop.
-            } else {
-                // No idle client is available. Create a new client (requires write lock).
-                drop(pool); // Release read lock
-                break;
             }
+        });
+    }
 
-            // Try again after a short wait.
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
+    /// Periodically prints pool metrics to the console
+    pub fn start_monitor_reporter(&self, interval_dur: Duration) {
+        let pool = self.clone();
+        tokio::spawn(async move {
+            let mut interval = time::interval(interval_dur);
+            loop {
+                interval.tick().await;
+                let total = pool.total_count();
+                let idle = pool.idle_count();
+                let working = pool.working_count();
 
-        // If you still can't find it, create a new client.
-        let mut pool = self.inner.write().await;
-        let new_id = self.update_id.fetch_add(1, Ordering::Relaxed);
-        let mut new_client = ClientInner::new();
-        new_client.used_flag = true;
-        new_client.idle_tick = Instant::now();
-        let client = new_client.client.clone();
-        pool.insert(new_id, new_client);
-        Some(PooledClientInner {
-            client,
+                println!(
+                    "[POOL MONITOR] Total: {}, Idle: {}, Working: {}, Load: {:.1}%",
+                    total,
+                    idle,
+                    working,
+                    if total > 0 {
+                        (working as f64 / total as f64) * 100.0
+                    } else {
+                        0.0
+                    }
+                );
+            }
+        });
+    }
+
+    /// Acquire a client from the pool or create a new one if permitted
+    pub async fn malloc(&self) -> Option<PooledClient> {
+        // Wait for a permit from the semaphore (limit global concurrency)
+        let permit = self.semaphore.clone().acquire_owned().await.ok()?;
+
+        let mut rx = self.idle_rx.lock().await;
+        let client = match rx.try_recv() {
+            Ok(idle) => {
+                // Reuse existing client
+                self.idle_count.fetch_sub(1, Ordering::Relaxed);
+                idle.client
+            }
+            Err(_) => {
+                // Pool is empty but semaphore allowed it: create new client
+                self.total_count.fetch_add(1, Ordering::Relaxed);
+                Client::new()
+            }
+        };
+
+        Some(PooledClient {
+            client: Some(client),
+            _permit: permit,
             release_tx: self.release_tx.clone(),
-            id: new_id,
-            leak_notice: self.handle_leak_channel.clone(),
+            idle_count: self.idle_count.clone(),
         })
     }
 
-    /// Get the current pool size
-    pub async fn size(&self) -> usize {
-        self.inner.read().await.len()
+    // --- Metric API ---
+
+    /// Returns the number of clients currently available in the pool
+    pub fn idle_count(&self) -> usize {
+        self.idle_count.load(Ordering::Relaxed)
     }
 
-    /// Get the number of clients currently in use
-    pub async fn used_count(&self) -> usize {
-        self.inner
-            .read()
-            .await
-            .iter()
-            .filter(|(_, h)| h.used_flag)
-            .count()
+    /// Returns the total number of clients managed by this pool
+    pub fn total_count(&self) -> usize {
+        self.total_count.load(Ordering::Relaxed)
     }
 
-    /// Get the number of currently idle clients
-    pub async fn idle_count(&self) -> usize {
-        let pool = self.inner.read().await;
-        pool.len() - pool.iter().filter(|(_, h)| h.used_flag).count()
-    }
-}
-
-impl Default for ClientPool {
-    fn default() -> Self {
-        Self::new()
+    /// Returns the number of clients currently borrowed and in use
+    pub fn working_count(&self) -> usize {
+        self.total_count().saturating_sub(self.idle_count())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// Normal requests during testing do not exceed the pool size.
-    async fn test_normal_requests(pool: &ClientPool, count: usize) {
-        tracing::info!("Start with {} normal requests...", count);
-
-        for i in 0..count {
-            if let Some(client) = pool.malloc().await {
-                tracing::info!("  Request {}: Get Client ID: {}", i, client.id());
-
-                // Simulate network requests
-                match tokio::time::timeout(
-                    Duration::from_millis(100),
-                    simulate_http_request(&client),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => tracing::info!("  Request {}: ✓ Success", i),
-                    Ok(Err(e)) => tracing::info!("  Request {}: ✗ Failed: {}", i, e),
-                    Err(_) => tracing::info!("  Request {}: ⏱️ Timeout", i),
-                }
-
-                // The client is automatically dropped and released back into the pool.
-                drop(client);
-
-                // Take a short break
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            } else {
-                tracing::info!("  Request {}: ✗ Unable to retrieve client information", i);
-            }
-        }
-
-        tracing::info!("Normal request test completed");
-    }
-
-    /// Testing concurrent requests, exceeding pool size
-    async fn test_concurrent_requests(pool: &ClientPool, concurrent_count: usize) {
-        tracing::info!(
-            "Start {} concurrent requests (pool default size: {})...",
-            concurrent_count,
-            CLIENT_POOL_DEFAULT_SIZE
-        );
-
-        let mut handles = Vec::new();
-        let start_time = Instant::now();
-
-        for i in 0..concurrent_count {
-            let pool_clone = pool.clone();
-            let handle = tokio::spawn(async move {
-                if let Some(client) = pool_clone.malloc().await {
-                    let request_time = start_time.elapsed().as_millis();
-                    tracing::info!(
-                        "  Request {}: [T+{}ms] Get Client ID: {}",
-                        i,
-                        request_time,
-                        client.id
-                    );
-
-                    // Simulate requests at different times
-                    let sleep_time = 100 + (i as u64 * 20) % 300;
-                    tokio::time::sleep(Duration::from_millis(sleep_time)).await;
-
-                    match simulate_http_request(&client).await {
-                        Ok(_) => tracing::info!(
-                            "  Request {}: ✓ Successful (Time taken {}ms)",
-                            i,
-                            sleep_time
-                        ),
-                        Err(e) => tracing::info!("  Request {}: ✗ Failed: {}", i, e),
-                    }
-
-                    // Note: The client will automatically drop the block at the end.
-                } else {
-                    tracing::info!("  Request {}: ✗ Unable to retrieve client information", i);
-                }
-            });
-
-            handles.push(handle);
-        }
-
-        // Waiting for all requests to complete
-        for handle in handles {
-            let _ = handle.await;
-        }
-
-        let total_time = start_time.elapsed().as_secs_f32();
-        tracing::info!(
-            "Concurrent request test complete, total time: {:.2} seconds",
-            total_time
-        );
-    }
-
-    /// Test sudden surge in requests
-    async fn test_burst_requests(pool: &ClientPool, burst_count: usize, total_requests: usize) {
-        tracing::info!(
-            "Test burst requests: {} concurrent requests, total {} requests",
-            burst_count,
-            total_requests
-        );
-
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(burst_count));
-        let success_counter = Arc::new(AtomicUsize::new(0));
-        let failure_counter = Arc::new(AtomicUsize::new(0));
-
-        let start_time = Instant::now();
-
-        let mut tasks = Vec::new();
-
-        for i in 0..total_requests {
-            let pool_clone = pool.clone();
-            let semaphore_clone = semaphore.clone();
-            let success_counter_clone = success_counter.clone();
-            let failure_counter_clone = failure_counter.clone();
-
-            let task = tokio::spawn(async move {
-                // Acquire semaphores to control concurrency.
-                let _permit = semaphore_clone.acquire().await.unwrap();
-
-                if let Some(client) = pool_clone.malloc().await {
-                    // Simulated random request time
-                    let sleep_time = rand::random::<u64>() % 200 + 50;
-                    tokio::time::sleep(Duration::from_millis(sleep_time)).await;
-
-                    match simulate_http_request(&client).await {
-                        Ok(_) => {
-                            success_counter_clone.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(_) => {
-                            failure_counter_clone.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-
-                    // client automatically drops
-                } else {
-                    failure_counter_clone.fetch_add(1, Ordering::Relaxed);
-                }
-            });
-
-            tasks.push(task);
-
-            // Control request generation speed
-            if i % 10 == 0 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        }
-
-        // Waiting for all tasks to complete
-        for task in tasks {
-            let _ = task.await;
-        }
-
-        let total_time = start_time.elapsed().as_secs_f32();
-        let success = success_counter.load(Ordering::Relaxed);
-        let failure = failure_counter.load(Ordering::Relaxed);
-
-        tracing::info!("Burst request test complete:");
-        tracing::info!("  Successful: {}", success);
-        tracing::info!("  Failures: {}", failure);
-        tracing::info!("  Total time: {:.2} seconds", total_time);
-        tracing::info!("  Average QPS: {:.1}", total_requests as f32 / total_time);
-    }
-
-    /// Test long-term operation
-    async fn test_long_running(pool: &ClientPool, duration_secs: u64) {
-        tracing::info!("Long-running test {} seconds...", duration_secs);
-
-        let start_time = Instant::now();
-        let end_time = start_time + Duration::from_secs(duration_secs);
-
-        let mut request_count = 0;
-
-        while Instant::now() < end_time {
-            request_count += 1;
-
-            if let Some(client) = pool.malloc().await {
-                // Simulated random request time
-                let sleep_time = rand::random::<u64>() % 100 + 50;
-                tokio::time::sleep(Duration::from_millis(sleep_time)).await;
-
-                let _result = simulate_http_request(&client).await;
-
-                // random interval
-                let interval = rand::random::<u64>() % 50;
-                tokio::time::sleep(Duration::from_millis(interval)).await;
-            }
-
-            // The status is printed once every 100 requests.
-            if request_count % 100 == 0 {
-                let elapsed = start_time.elapsed().as_secs();
-                tracing::info!(
-                    "  [T+{}s] {} requests have been processed.",
-                    elapsed,
-                    request_count
-                );
-            }
-        }
-
-        tracing::info!(
-            "The long-running test has completed, processing a total of {} requests.",
-            request_count
-        );
-    }
-
-    /// Simulate HTTP requests
-    async fn simulate_http_request(_client: &PooledClientInner) -> Result<(), String> {
-        // This uses a simulated HTTP request.
-        // In practical use, you can replace it with the actual request code.
-        // let one = _client.client.clone();
-        // if one.get("http://127.0.0.1:9002").send().await.is_ok() {
-        //     Ok(())
-        // } else {
-        //     Err("Simulated request failed".to_string())
-        // }
-        // Simulate a 90% success rate
-        if rand::random::<f32>() < 0.9 {
-            Ok(())
-        } else {
-            Err("Simulated request failed".to_string())
-        }
-    }
-
+    // mod client_pool; // 假设上面的代码在 client_pool.rs
+    // use client_pool::ClientPool;
+    use std::time::Duration;
+    use tokio::time::sleep;
     #[tokio::test]
     async fn test() {
-        tracing::info!("=== Start ClientPool Test ===");
-
-        // Create a connection pool
+        // 1. Initialize the pool (English logs enabled by reporter)
         let pool = ClientPool::new();
+        println!(">>> Test Started: Simulating High Load for 15s <<<");
 
-        tracing::info!(
-            "✓ Connection pool created successfully, default size: {}",
-            CLIENT_POOL_DEFAULT_SIZE
-        );
-
-        // Monitoring task - Print pool status once per second
-        let pool_monitor = pool.clone();
-        tokio::spawn(async move {
-            let mut interval = time::interval(Duration::from_secs(1));
-            let mut tick_count = 0;
-
-            loop {
-                interval.tick().await;
-                tick_count += 1;
-
-                let pool_guard = pool_monitor.inner.read().await;
-                let used_count = pool_guard.iter().filter(|(_, h)| h.used_flag).count();
-                let idle_count = pool_guard.len() - used_count;
-                let total_count = pool_guard.len();
-
-                // Find the largest ID to understand the pool's expansion.
-                let max_id = pool_guard.keys().max().unwrap_or(&0);
-
-                tracing::info!(
-                    "[Monitoring {}s] Pool size: {} (In use: {}, Idle: {}), Maximum ID: {}, Next ID: {}",
-                    tick_count,
-                    total_count,
-                    used_count,
-                    idle_count,
-                    max_id,
-                    pool_monitor.update_id.load(Ordering::Relaxed)
-                );
-
-                // Detailed information is printed every 10 seconds.
-                if tick_count % 10 == 0 {
-                    tracing::info!("=== Detailed Status ===");
-                    for (id, client) in pool_guard.iter() {
-                        let age = client.idle_tick.elapsed().as_secs();
-                        tracing::info!(
-                            "  Client ID: {}, In Use: {}, Created: {} seconds ago",
-                            id,
-                            client.used_flag,
-                            age
-                        );
+        // 2. Spawn concurrent tasks to consume clients
+        for i in 0..40 {
+            let p = pool.clone();
+            tokio::spawn(async move {
+                if let Some(_client) = p.malloc().await {
+                    // Use the client for a simulated request
+                    sleep(Duration::from_secs(2)).await;
+                    if i % 10 == 0 {
+                        println!("   [Task {}] Request completed.", i);
                     }
-                    tracing::info!("================");
                 }
+            });
+            // Stagger task starts
+            sleep(Duration::from_millis(50)).await;
+        }
+
+        // 3. Observe the Scaling Down phase
+        println!(">>> Load Phase Ended: Waiting for Scale-Down (15s) <<<");
+        for sec in 1..=240 {
+            sleep(Duration::from_secs(1)).await;
+            if sec % 5 == 0 {
+                println!(
+                    "   Snapshot at {}s: Working={}, Idle={}",
+                    sec,
+                    pool.working_count(),
+                    pool.idle_count()
+                );
             }
-        });
+        }
 
-        // Wait 1 second to start the monitoring task.
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        // Test 1: Normal requests, not exceeding the pool size
-        tracing::info!("\n=== Test 1: Normal requests (not exceeding the pool size) ===");
-        test_normal_requests(&pool, 3).await;
-
-        // Test 2: Concurrent requests exceeding pool size
-        tracing::info!("\n=== Test 2: Concurrent requests exceeding pool size ===");
-        test_concurrent_requests(&pool, 15).await;
-
-        // Wait 10 seconds to observe whether the pool shrinks.
-        tracing::info!("\n=== Wait 10 seconds to observe whether the pool shrinks. ===");
-        tokio::time::sleep(Duration::from_secs(10)).await;
-
-        // Test 3: Sudden surge in requests
-        tracing::info!("\n=== Test 3: Sudden surge in requests ===");
-        test_burst_requests(&pool, 30, 100).await;
-
-        // Test 4: Long-run test
-        tracing::info!("\n=== Test 4: Long-duration test (30 seconds) ===");
-        test_long_running(&pool, 30).await;
-
-        tracing::info!("\n=== Test completed ===");
+        println!(">>> Test Finished <<<");
     }
 }
