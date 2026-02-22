@@ -1,6 +1,6 @@
 [package]
 name = "reqwest-management-pool"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "advanced reqwest pool management to improve utilization per client."
 keywords = ["pool", "http", "request", "client"]

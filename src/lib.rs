@@ -46,9 +46,10 @@ use tokio::time::{self, Duration, Instant};
 
 // Configuration constants
 const MIN_IDLE_SIZE: usize = 8; // Minimum number of clients to keep in the pool
-const MAX_POOL_SIZE: usize = 50; // Maximum total clients (active + idle)
+const MAX_POOL_SIZE: usize = 100; // Maximum total clients (active + idle)
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120); // Time before an idle client is retired
-const MONITOR_INTERVAL: Duration = Duration::from_secs(180); // Time between pool metrics reports
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(90); // Time between idle client cleanup runs
+const MONITOR_INTERVAL: Duration = Duration::from_secs(150); // Time between pool metrics reports
 /// Internal wrapper for an idle client with a timestamp
 struct IdleClient {
     client: Client,
@@ -68,21 +69,21 @@ pub struct ClientPool {
 }
 
 /// A smart wrapper for a borrowed client. Returns to pool automatically on Drop.
-pub struct PooledClient {
+pub struct PooledClientInner {
     client: Option<Client>,
     _permit: OwnedSemaphorePermit, // Holds the slot in the semaphore
     release_tx: mpsc::Sender<IdleClient>,
     idle_count: Arc<AtomicUsize>,
 }
 
-impl PooledClient {
+impl PooledClientInner {
     /// Get a reference to the inner reqwest Client
     pub fn get(&self) -> &Client {
         self.client.as_ref().expect("Client should be present")
     }
 }
 
-impl Drop for PooledClient {
+impl Drop for PooledClientInner {
     /// When the user is done with the client, send it back to the idle queue
     fn drop(&mut self) {
         if let Some(client) = self.client.take() {
@@ -143,7 +144,7 @@ impl ClientPool {
         let total_count = self.total_count.clone();
 
         tokio::spawn(async move {
-            let mut interval = time::interval(Duration::from_secs(5));
+            let mut interval = time::interval(CLEANUP_TIMEOUT);
             loop {
                 interval.tick().await;
                 let mut rx = idle_rx.lock().await;
@@ -197,7 +198,7 @@ impl ClientPool {
     }
 
     /// Acquire a client from the pool or create a new one if permitted
-    pub async fn malloc(&self) -> Option<PooledClient> {
+    pub async fn malloc(&self) -> Option<PooledClientInner> {
         // Wait for a permit from the semaphore (limit global concurrency)
         let permit = self.semaphore.clone().acquire_owned().await.ok()?;
 
@@ -215,7 +216,7 @@ impl ClientPool {
             }
         };
 
-        Some(PooledClient {
+        Some(PooledClientInner {
             client: Some(client),
             _permit: permit,
             release_tx: self.release_tx.clone(),
@@ -244,8 +245,6 @@ impl ClientPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // mod client_pool; // 假设上面的代码在 client_pool.rs
-    // use client_pool::ClientPool;
     use std::time::Duration;
     use tokio::time::sleep;
     #[tokio::test]

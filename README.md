@@ -25,9 +25,9 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-reqwest-management-pool = "0.1.2"
+reqwest-management-pool = "0.1.3"
 tokio = { version = "1.49.0", features = ["full"] }
-reqwest = "0.13.1"
+reqwest = "0.13.2"
 ```
 
 ### Quick Start
@@ -123,12 +123,12 @@ async fn main() {
     let pool = ClientPool::new();
     
     // Get pool statistics
-    let total_size = pool.size().await;
-    let used_count = pool.used_count().await;
+    let total_size = pool.total_count().await;
+    let working_count = pool.working_count().await;
     let idle_count = pool.idle_count().await;
     
     println!("Pool size: {}", total_size);
-    println!("Clients in use: {}", used_count);
+    println!("Clients in use: {}", working_count);
     println!("Idle clients: {}", idle_count);
 }
 ```
@@ -145,8 +145,9 @@ The main structure for managing the HTTP client pool.
   
   Creates a new client pool with default settings:
   - Default pool size: 8 clients
+  - Maximum pool size: 100 clients
   - Idle timeout: 120 seconds
-  - Cleanup interval: 180 seconds
+  - Cleanup interval: 90 seconds
 
 - **`malloc() -> Option<PooledClientInner>`**
   
@@ -154,11 +155,11 @@ The main structure for managing the HTTP client pool.
   
   The returned client is automatically returned to the pool when dropped.
 
-- **`size() -> usize`**
+- **`total_count() -> usize`**
   
   Returns the current total number of clients in the pool.
 
-- **`used_count() -> usize`**
+- **`working_count() -> usize`**
   
   Returns the number of clients currently in use.
 
@@ -170,23 +171,14 @@ The main structure for managing the HTTP client pool.
 
 A wrapper around a `reqwest::Client` that automatically returns to the pool when dropped.
 
-##### Methods
-
-- **`get() -> &Client`**
-  
-  Returns a reference to the underlying `reqwest::Client`.
-
-- **`id() -> usize`**
-  
-  Returns the unique ID of this client in the pool.
-
 ### Configuration
 
 The pool uses the following default constants (defined in `src/lib.rs`):
 
-- `CLIENT_POOL_DEFAULT_SIZE`: 8 (default pool size)
-- `CLIENT_POOL_IDLE_CLEANUP_TIMEOUT`: 180 seconds (idle client timeout)
-- `CLIENT_POOL_IDLE_TASK_TIMEOUT`: 120 seconds (cleanup task interval)
+- `MIN_IDLE_SIZE`: 8 (default pool size)
+- `MAX_SIZE`: 100 (maximum pool size)
+- `IDLE_TIMEOUT`: 120 seconds (idle client timeout)
+- `CLEANUP_INTERVAL`: 90 seconds (cleanup task interval)
 
 To customize these values, you can modify the constants in the source code or fork the repository.
 
@@ -207,13 +199,6 @@ To customize these values, you can modify the constants in the source code or fo
    - Checks for idle clients that have exceeded the idle timeout
    - Removes them from the pool (but keeps at least the default pool size)
    - This prevents memory bloat during low-traffic periods
-
-### Performance Considerations
-
-- The pool uses `RwLock` for concurrent access, which allows multiple readers simultaneously
-- Clients are stored in a `HashMap` for O(1) lookup
-- The pool automatically expands under load and shrinks during idle periods
-- Connection reuse significantly reduces the overhead of establishing new TCP connections
 
 ### License
 
@@ -242,9 +227,9 @@ This project is licensed under the MIT License.
 
 ```toml
 [dependencies]
-reqwest-management-pool = "0.1.2"
+reqwest-management-pool = "0.1.3"
 tokio = { version = "1.49.0", features = ["full"] }
-reqwest = "0.13.1"
+reqwest = "0.13.2"
 ```
 
 ### 快速开始
@@ -340,12 +325,12 @@ async fn main() {
     let pool = ClientPool::new();
     
     // 获取池统计信息
-    let total_size = pool.size().await;
-    let used_count = pool.used_count().await;
+    let total_size = pool.total_count().await;
+    let working_count = pool.working_count().await;
     let idle_count = pool.idle_count().await;
     
     println!("池大小: {}", total_size);
-    println!("使用中的客户端: {}", used_count);
+    println!("使用中的客户端: {}", working_count);
     println!("空闲客户端: {}", idle_count);
 }
 ```
@@ -362,8 +347,8 @@ async fn main() {
   
   创建一个具有默认设置的新客户端池：
   - 默认池大小：8 个客户端
-  - 空闲超时：180 秒
-  - 清理间隔：120 秒
+  - 空闲超时：120 秒
+  - 清理间隔：90 秒
 
 - **`malloc() -> Option<PooledClientInner>`**
   
@@ -371,11 +356,11 @@ async fn main() {
   
   返回的客户端在销毁时会自动返回池中。
 
-- **`size() -> usize`**
+- **`total_count() -> usize`**
   
   返回池中当前客户端的总数。
 
-- **`used_count() -> usize`**
+- **`working_count() -> usize`**
   
   返回当前正在使用的客户端数量。
 
@@ -401,9 +386,10 @@ async fn main() {
 
 池使用以下默认常量（在 `src/lib.rs` 中定义）：
 
-- `CLIENT_POOL_DEFAULT_SIZE`: 8（默认池大小）
-- `CLIENT_POOL_IDLE_CLEANUP_TIMEOUT`: 180 秒（空闲客户端超时）
-- `CLIENT_POOL_IDLE_TASK_TIMEOUT`: 120 秒（清理任务间隔）
+- `MIN_IDLE_SIZE`: 8（默认池大小）
+- `MAX_SIZE`: 100（最大池大小）
+- `IDLE_TIMEOUT`: 120 秒（空闲客户端超时）
+- `CLEANUP_INTERVAL`: 90 秒（清理任务间隔）
 
 要自定义这些值，您可以修改源代码中的常量或 fork 仓库。
 
@@ -424,14 +410,7 @@ async fn main() {
    - 检查超过空闲超时的空闲客户端
    - 将它们从池中移除（但至少保留默认池大小）
    - 这可以防止在低流量期间内存膨胀
-
-### 性能考虑
-
-- 池使用 `RwLock` 进行并发访问，允许多个读取者同时访问
-- 客户端存储在 `HashMap` 中，实现 O(1) 查找
-- 池在负载下自动扩展，在空闲期间自动收缩
-- 连接复用显著减少了建立新 TCP 连接的开销
-
+   
 ### 许可证
 
 本项目采用 MIT 许可证。
